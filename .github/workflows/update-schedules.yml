@@ -1,0 +1,92 @@
+name: update-schedules
+
+on:
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT }}
+
+      - name: Fetch JSON
+        id: fetch
+        run: |
+          JSON=$(curl -s -H "x-api-key: ${{ secrets.NETLIFY_API_KEY }}" "https://${{ secrets.APP_HOST }}/.netlify/functions/get-todays-cron")
+          echo "json=$JSON" >> $GITHUB_OUTPUT
+
+      - name: Extract next schedule
+        id: parse
+        run: |
+          # Example: JSON contains { "regularcron": "15 * * * *", "livecron": "15 * * * *", "previewcron": "0 10 * * *" }
+
+          REGULARCRON=$(echo '${{ steps.fetch.outputs.json }}' | jq -r '.regularcron')
+          LIVECRON=$(echo '${{ steps.fetch.outputs.json }}' | jq -r '.livecron')
+          PREVIEWCRON=$(echo '${{ steps.fetch.outputs.json }}' | jq -r '.previewcron')
+
+          echo "regularcron=$REGULARCRON" >> $GITHUB_OUTPUT
+          echo "livecron=$LIVECRON" >> $GITHUB_OUTPUT
+          echo "previewcron=$PREVIEWCRON" >> $GITHUB_OUTPUT
+
+      - name: Update workflow files
+        run: |
+          expand_cron() {
+            CRON="$1"
+            FILE="$2"
+
+            # Split cron into fields
+            MIN=$(echo "$CRON" | awk '{print $1}')
+            HOUR=$(echo "$CRON" | awk '{print $2}')
+            REST=$(echo "$CRON" | cut -d' ' -f3-)
+
+            # Split hours by comma
+            IFS=',' read -ra HOURS <<< "$HOUR"
+
+            # Build new cron entries
+            NEW=""
+            for H in "${HOURS[@]}"; do
+              NEW="$NEW    - cron: \"$MIN $H $REST\"\n"
+            done
+
+            # Remove ONLY cron lines under schedule:
+            sed -i '/schedule:/,/^[^ ]/ { /cron:/d }' "$FILE"
+
+            # Insert new cron entries after "schedule:"
+            awk -v new="$NEW" '
+              /schedule:/ {
+                print
+                printf "%s", new
+                next
+              }
+              { print }
+            ' "$FILE" > tmp && mv tmp "$FILE"
+          }
+
+          expand_cron "${{ steps.parse.outputs.regularcron }}" ".github/workflows/results.yml"
+          expand_cron "${{ steps.parse.outputs.livecron }}" ".github/workflows/subscribed-live-events.yml"
+          expand_cron "${{ steps.parse.outputs.previewcron }}" ".github/workflows/notify-about-todays-events.yml"
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add .github/workflows/results.yml
+          git add .github/workflows/subscribed-live-events.yml
+          git add .github/workflows/notify-about-todays-events.yml
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update schedules to regular:${{ steps.parse.outputs.regularcron }}, live:${{ steps.parse.outputs.livecron }}, preview:${{ steps.parse.outputs.previewcron }}"
+            git push
+          fi
